@@ -1,36 +1,94 @@
-exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
-  }
-  try {
-    const { messages, systemInstruction } = JSON.parse(event.body);
-    const apiKey = process.env.GEMINI_API_KEY;
-    
-    // Conexión directa a Google sin validar formatos raros de texto
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-    
-    const geminiContents = messages.map(m => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.parts[0].text || m.parts[0] }]
-    }));
+// netlify/functions/chat.js
+// Backend seguro: recibe mensajes del frontend, llama a Gemini, devuelve respuesta.
+// La GEMINI_API_KEY nunca sale del servidor.
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: geminiContents,
-        systemInstruction: systemInstruction,
-        generationConfig: { responseMimeType: "application/json" }
-      })
-    });
-    
-    const data = await response.json();
+exports.handler = async function (event, context) {
+  const headers = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Content-Type": "application/json",
+  };
+
+  // Responder preflight de CORS
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers, body: "" };
+  }
+
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 405, headers, body: JSON.stringify({ error: "Método no permitido" }) };
+  }
+
+  const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+  if (!GEMINI_API_KEY) {
+    return {
+      statusCode: 500,
+      headers,
+      body: JSON.stringify({ error: "GEMINI_API_KEY no configurada en variables de entorno de Netlify" }),
+    };
+  }
+
+  let messages, systemPrompt;
+  try {
+    ({ messages, systemPrompt } = JSON.parse(event.body));
+  } catch {
+    return { statusCode: 400, headers, body: JSON.stringify({ error: "Body inválido" }) };
+  }
+
+  // Convertir formato {role, content} → formato Gemini {role, parts}
+  // Gemini usa "model" en lugar de "assistant"
+  const contents = messages.map((m) => ({
+    role: m.role === "assistant" ? "model" : "user",
+    parts: [{ text: m.content }],
+  }));
+
+  // Gemini requiere que el primer mensaje sea del usuario
+  // y que los roles alternen. Si hay mensajes de sistema mezclados, los filtramos.
+  const validContents = contents.filter(
+    (c) => c.role === "user" || c.role === "model"
+  );
+
+  const geminiBody = {
+    contents: validContents,
+    systemInstruction: {
+      parts: [{ text: systemPrompt }],
+    },
+    generationConfig: {
+      maxOutputTokens: 700,
+      temperature: 0.2, // Bajo para respuestas consistentes con JSON
+    },
+  };
+
+  try {
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(geminiBody),
+      }
+    );
+
+    const geminiData = await geminiRes.json();
+
+    if (!geminiRes.ok) {
+      const errMsg = geminiData?.error?.message || "Error de Gemini API";
+      return { statusCode: 502, headers, body: JSON.stringify({ error: errMsg }) };
+    }
+
+    const text =
+      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+
     return {
       statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data)
+      headers,
+      body: JSON.stringify({ text }),
     };
-  } catch (error) {
-    return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+  } catch (err) {
+    return {
+      statusCode: 502,
+      headers,
+      body: JSON.stringify({ error: `Error llamando a Gemini: ${err.message}` }),
+    };
   }
 };
